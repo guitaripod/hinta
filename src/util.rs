@@ -1,3 +1,17 @@
+use std::time::Duration;
+
+/// Converts a user-supplied seconds value into a delay `Duration`, clamping to a
+/// sane range and rejecting non-finite input.
+///
+/// `Duration::from_secs_f64` panics on `inf`, `NaN` or an over-large value, and
+/// `f64::max` only neutralizes negatives — so a stray `--delay inf` would abort
+/// the process. This returns `None` for non-finite input so the caller can
+/// surface a clean error instead.
+pub fn duration_from_secs(secs: f64) -> Option<Duration> {
+    secs.is_finite()
+        .then(|| Duration::from_secs_f64(secs.clamp(0.0, 3600.0)))
+}
+
 /// Percent-encodes a string for use in a URL query value.
 ///
 /// Encodes per UTF-8 byte rather than per `char`, so Finnish characters such as
@@ -234,6 +248,16 @@ mod tests {
     #[test]
     fn squeeze_whitespace_normalizes_nbsp_and_newlines() {
         assert_eq!(squeeze_whitespace("  a\n\t b \u{a0} c  "), "a b c");
+    }
+
+    #[test]
+    fn duration_from_secs_rejects_non_finite_and_clamps() {
+        assert_eq!(duration_from_secs(1.5), Some(Duration::from_secs_f64(1.5)));
+        assert_eq!(duration_from_secs(-5.0), Some(Duration::ZERO));
+        assert_eq!(duration_from_secs(0.0), Some(Duration::ZERO));
+        assert_eq!(duration_from_secs(1e300), Some(Duration::from_secs(3600)));
+        assert_eq!(duration_from_secs(f64::INFINITY), None);
+        assert_eq!(duration_from_secs(f64::NAN), None);
     }
 
     #[test]

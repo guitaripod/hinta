@@ -131,6 +131,22 @@ fn microdata(doc: &Html, prop: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// The product title from the page heading.
+///
+/// Preferred over an unscoped `[itemprop="name"]` lookup, because PrestaShop
+/// emits the breadcrumb trail — `Etusivu`, then each category — as `itemprop`
+/// `name` elements *before* the product's own `h1`, so the naive lookup returns
+/// "Etusivu" for every product.
+fn product_title(doc: &Html) -> Option<String> {
+    let selector =
+        Selector::parse("h1.product_name, h1[itemprop=\"name\"], h1, .h1.product-title, .product-name")
+            .ok()?;
+    doc.select(&selector)
+        .next()
+        .map(|el| crate::util::squeeze_whitespace(&el.text().collect::<String>()))
+        .filter(|n| !n.is_empty())
+}
+
 /// Parses a product page, preferring JSON-LD and falling back to the microdata
 /// and CSS selectors that PrestaShop themes vary on.
 pub(crate) fn parse_product_page(html: &str, product_id: &str, url: &str) -> Option<Product> {
@@ -140,13 +156,8 @@ pub(crate) fn parse_product_page(html: &str, product_id: &str, url: &str) -> Opt
     let name = ld
         .as_ref()
         .and_then(|l| l.name.clone())
+        .or_else(|| product_title(&doc))
         .or_else(|| microdata(&doc, "name"))
-        .or_else(|| {
-            let selector = Selector::parse("h1, .h1, .product-name, .product-title").ok()?;
-            doc.select(&selector)
-                .next()
-                .map(|el| crate::util::squeeze_whitespace(&el.text().collect::<String>()))
-        })
         .filter(|n| !n.is_empty())?;
 
     let price = ld
@@ -386,6 +397,26 @@ mod tests {
         assert_eq!(product.price_euro, 359.90);
         assert_eq!(product.ean.as_deref(), Some("0730143314930"));
         assert_eq!(product.in_stock, Some(true));
+    }
+
+    #[test]
+    fn ignores_breadcrumb_itemprop_name_and_reads_the_product_title() {
+        // PrestaShop lists the breadcrumb (Etusivu → category → subcategory) as
+        // itemprop=name elements before the product h1; the naive first-match
+        // lookup used to return "Etusivu" for every product.
+        let html = r#"<html><body>
+          <nav class="breadcrumb"><span itemprop="name">Etusivu</span>
+            <span itemprop="name">Komponentit</span>
+            <span itemprop="name">Prosessorit</span></nav>
+          <h1 class="product_name" itemprop="name">AMD Ryzen 7 7800X3D</h1>
+          <span itemprop="gtin13">0730143314930</span>
+          <meta itemprop="price" content="359.90">
+        </body></html>"#;
+
+        let product = parse_product_page(html, "1234", "https://www.datatronic.fi/x").unwrap();
+        assert_eq!(product.name, "AMD Ryzen 7 7800X3D");
+        assert_eq!(product.ean.as_deref(), Some("0730143314930"));
+        assert_eq!(product.price_euro, 359.90);
     }
 
     #[test]

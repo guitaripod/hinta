@@ -1,14 +1,16 @@
 # Hinta — Agent-Native CLI for Finnish Electronics Retailers
 
-Rust, 7908 lines, 176 tests. Two binaries: `hinta` (CLI) and `hinta-mcp` (MCP server). SQLite at `~/.local/share/hinta/hinta.db`.
+Rust, 9032 lines, 196 tests. Two binaries: `hinta` (CLI) and `hinta-mcp` (MCP server). SQLite at `~/.local/share/hinta/hinta.db`.
 
 ## Quick start
 
 ```bash
 cargo build --release
-cargo test                                          # 176 tests, no network needed
+cargo test                                          # 196 tests, no network needed
 ./target/release/hinta compare "7800x3d" --enrich --json          # group across retailers
 ./target/release/hinta search "televisio" --devices-only --min-inches 65 --in-stock
+./target/release/hinta ingest power --limit 500                    # pull a catalogue from the sitemap
+./target/release/hinta search "samsung u80" --local               # search it offline
 ./target/release/hinta sources --json               # capabilities + robots status per retailer
 ```
 
@@ -33,6 +35,7 @@ Six of seven retailers serve search. Every entry below was confirmed against the
 - **Gigantti's 429 is not rate limiting.** It is Vercel Attack Challenge Mode, which admits only allow-listed crawler User-Agents; the first cold request 429s and `robots.txt` itself 429s. Retrying or slowing down cannot help, so the source fails fast on `x-vercel-mitigated: challenge` instead. Search is doubly closed: the results page is client-rendered, and `robots.txt` disallows both `/api/` and `?_rsc=`. Product pages parse fine *if* reachable. `HINTA_GIGANTTI_UA` overrides the User-Agent — the shipped default impersonates nobody, and Vercel labels crawler-UA requests from this network `x-vercel-bot-status: impersonation`, so setting it is the operator's call, not the tool's.
 - **Jimms rejects an empty User-Agent with 403.** One must always be sent.
 - **Multitronic's search never reaches the server as a query string** — JS rewrites the form to a URL fragment. The real endpoint is the `gpl` POST.
+- **Unscoped `[itemprop="name"]` reads the breadcrumb, not the product.** Datatronic and Jimms emit the breadcrumb trail (`Etusivu` / `Jimms.fi`, then each category) as `itemprop=name` elements *before* the product's `<h1>`, so a first-match microdata lookup named every product "Etusivu"/"Jimms.fi". Both product parsers now prefer the `<h1>` title. Jimms also carries stock in a `<link href>` and the image in `<img src>` (not `content`), so its microdata reader tries a list of attributes. The unit fixtures ordered the real name first, which masked all of this — a reminder to capture the *breadcrumb* in a fixture, not just the happy path.
 
 ## robots.txt posture
 
@@ -51,7 +54,7 @@ Evidence is applied strongest-first. A validated EAN is decisive **in both direc
 
 Four hard vetoes, any of which blocks a merge outright:
 
-1. **Different validated EANs.** GTINs are checksum-validated, so a retailer's junk internal reference cannot merge two unrelated products.
+1. **Different validated EANs.** GTINs are checksum-validated, so a retailer's junk internal reference cannot merge two unrelated products. Checksum-valid *placeholders* whose body is a short repeating cycle (`5656565656562`, `0000000000000`) are also rejected — Multitronic ships one such dummy that passes the checksum, and trusting it would merge every product that reuses it.
 2. **Different qualifiers.** `ti`, `super`, `xt`, `pro`, `evo`, `plus`, `max`, … plus heatsink wording. This is what keeps `RTX 4070` / `4070 Ti` / `4070 Super` apart, and `990 PRO` from `990 EVO Plus`. Deliberately excludes inconsistently stated packaging words like `WOF` or `boxed`, which would cause false splits.
 3. **Different measurements.** Normalized onto one scale first, in two families:
    - **Capacity** — `1 Tt` (Finnish *teratavu*), `1TB` and `1000 GB` all become `cap:1000gb`.
@@ -95,6 +98,18 @@ Datatronic, Jimms, Multitronic and Proshop omit EANs from search results. `--enr
 
 It converts a fuzzy match into a certain one *and* finds retailers that could not otherwise be grouped confidently. It is opt-in because it costs requests, and Proshop throttles per IP.
 
+## Sitemap ingest and offline search (`src/sitemap/`)
+
+`hinta ingest <retailer>` walks a retailer's sitemap and stores every product in the local database; `search`/`compare --local` then query it offline and rank by hinta's own relevance rather than the retailer's. This is the answer to three problems no other route solves: it is the only robots-compliant way into **Gigantti** (its product pages are permitted even though search is walled off), it lets us own ranking instead of inheriting a retailer's bad relevance (Datatronic answering `televisio` with CPU coolers), and it harvests EANs once at ingest instead of per-query `--enrich`.
+
+**The load-bearing insight: ingest is a crawler, not a second parser.** Every retailer's `get_product` already turns a product URL into a full record, and every one accepts a full URL, so the driver is uniform: walk sitemap → keep product `<loc>`s → `source.get_product(loc)` → `record_sighting`. What differs per retailer is captured in an `IngestPlan` — the root URL, whether it is a flat `<urlset>` or a `<sitemapindex>`, which child sitemaps hold products, which `<loc>`s are products, whether `<lastmod>` is present, and any required env.
+
+- **Plans live in `plan_for`**, verified against each live sitemap: Power (flat `/services/sitemap.xml`, `/p-<digits>/`, ~33k, has `lastmod`), Verkkokauppa (index, keep `products-1..12`, drop `-eol`/`-en`/`-sv`, ~55k), Multitronic (index, `sitemap_product_*` children, keep `/fi/` locs and drop sv/ru, ~100k), Proshop (index `sitemap1..19`, products are the locs whose **last segment is all digits** — its category pages like `/Kytkimet/Lenovo` end in a slug, and `extract_id_from_url` returns that slug, so it *cannot* be the product test — ~310k), Gigantti (`OCFIGIG.pdp-*` index, `/product/` locs, ~459k, has `lastmod`, **requires `HINTA_GIGANTTI_UA`** or it bails with the reason). **Datatronic and Jimms have no plan** — Datatronic's sitemap is frozen at 2021 (half its URLs are dead, its product pages carry no numeric id), and Jimms publishes no sitemap.
+- **The XML parser is hand-rolled** (`parse_entries`), not a dependency: it pulls exact `<loc>`/`<lastmod>` pairs so `<image:loc>` is never mistaken for a product URL, associates each `<lastmod>` with the `<loc>` it follows via a forward-only two-pointer scan, and unescapes entities. Sitemaps are machine-generated and rigidly regular, which is why this is safe; it is covered by fixtures including the `<image:loc>` trap.
+- **Incremental re-ingest** uses the `ingest_state` table (`source, url` → `lastmod`). When a plan has `per_url_lastmod`, a URL whose stored `lastmod` matches the sitemap is skipped without a fetch; a URL with no `lastmod` is always re-fetched. Verified live: a second `ingest power --limit 6` reports `skipped_unchanged` for the already-seen URLs and fetches the next ones.
+- **Politeness.** Product pages are fetched serially with `--delay` (default 1s) because Proshop throttles per IP. With `--limit`, index crawls short-circuit after collecting ~4× the limit in product URLs, so a bounded test run does not download every child sitemap. The Gigantti ingest client sends *only* the crawler UA (no contradicting browser client-hints), matching what the origin admits.
+- **Local search** (`Store::search_local`) narrows candidates with an AND of `LIKE` clauses (identifiers via an `OR` escape hatch), then re-ranks in Rust by `matching::name_relevance`, which canonicalizes tokens the same way `compare` does (so a query `1tb` still ranks a stored `1 TB`). It never touches the network.
+
 ## Architecture
 
 ```
@@ -105,8 +120,9 @@ src/
   util.rs              # urlencode, parse_price, stock phrases, URL resolution
   http.rs              # browser headers, retry/backoff policy, Retry-After
   matching/mod.rs      # signatures, vetoes, scoring, clustering  ← read this first
+  sitemap/mod.rs       # sitemap XML parsing, per-retailer ingest plans, the ingest driver
   transform/types.rs   # Product, PricePoint, Source
-  store/mod.rs         # SQLite, migrations, sighting-based price history
+  store/mod.rs         # SQLite, migrations, sighting-based price history, ingest state, local search
   sources/
     mod.rs             # RetailerSource trait, enum dispatch, SourceInfo registry
     jsonld.rs          # shared schema.org Product extractor
@@ -126,8 +142,9 @@ src/
 ## CLI
 
 ```
-search <query>  [--limit N] [--source S] [FILTERS]
-compare <query> [--limit N] [--threshold F] [--multi-only] [--enrich] [FILTERS]
+search <query>  [--limit N] [--source S] [--local] [FILTERS]
+compare <query> [--limit N] [--threshold F] [--multi-only] [--enrich] [--local] [FILTERS]
+ingest <source|all> [--limit N] [--delay SECS] [--full]   # bulk-load a catalogue from its sitemap
 product <id|url> --source S                   # exit 2 when not found
 track / untrack <product_id> --source S
 alert <product_id> --source S --below PRICE   # implies track
@@ -143,11 +160,11 @@ FILTERS: --min-price --max-price --in-stock --min-inches --max-inches --brand --
 
 Every command takes `--json`. Diagnostics go to stderr, data to stdout, so piping into `jq` is always safe.
 
-## MCP tools (13)
+## MCP tools (14)
 
-`search`, `compare`, `get_product`, `track`, `untrack`, `list_tracked`, `price_history`, `refresh`, `sources`, `stats`, `set_alert`, `clear_alert`, `list_alerts`
+`search`, `compare`, `ingest`, `get_product`, `track`, `untrack`, `list_tracked`, `price_history`, `refresh`, `sources`, `stats`, `set_alert`, `clear_alert`, `list_alerts`
 
-`search` and `compare` take the same filter arguments as the CLI; `compare` also takes `enrich`.
+`search` and `compare` take the same filter arguments as the CLI, plus `local`; `compare` also takes `enrich`. `ingest` takes `source`/`limit`/`delay`/`full`.
 
 ```json
 {"mcpServers": {"hinta": {"command": "/home/marcus/Dev/hinta/target/release/hinta-mcp"}}}
@@ -163,9 +180,10 @@ products (id, source, name, url, image_url, ean, sku, brand, first_seen, last_se
 price_history (id INTEGER PK, product_id, source, price_euro, in_stock, recorded_at)
 tracked (product_id, source, added_at)  PRIMARY KEY (product_id, source)
 alerts  (product_id, source, target_price, created_at)  PRIMARY KEY (product_id, source)
+ingest_state (source, url, lastmod, fetched_at)  PRIMARY KEY (source, url)
 ```
 
-`sku` and the `alerts` table are added by migration on open, so existing databases upgrade in place (covered by a test). `set_alert` also tracks the product, since an alert on something `refresh` never checks would never fire.
+`sku`, the `alerts` table and the `ingest_state` table are added by migration on open, so existing databases upgrade in place (covered by a test). `set_alert` also tracks the product, since an alert on something `refresh` never checks would never fire. `ingest_state` records the `lastmod` each sitemap URL was last ingested at, so re-ingest can skip unchanged products.
 
 Data dir: `HINTA_DATA_DIR`, default `~/.local/share/hinta`.
 
@@ -175,8 +193,9 @@ Data dir: `HINTA_DATA_DIR`, default `~/.local/share/hinta`.
 
 ## Known gaps / next steps
 
-- [ ] Gigantti search needs a real browser or retailer feed access; product lookup needs a reachable identity.
-- [ ] Bulk catalogue ingest via sitemaps (Gigantti ~460k URLs, Proshop ~380k, Power 35k) would enable offline search, complete coverage for category sweeps, and EAN coverage without per-query enrichment. Gigantti's product pages are robots-permitted even though its search is not, so this is the only route to including it.
+- [x] **Bulk catalogue ingest via sitemaps** — done (`src/sitemap/`). Enables offline `--local` search, EAN coverage without per-query enrichment, and the only robots-compliant route into Gigantti. A *full* ingest of the large catalogues (Gigantti ~459k, Proshop ~310k, Multitronic ~100k) has not been run here — it is a long, per-IP-throttled crawl the operator should schedule; the capability is built, tested, and verified on bounded runs.
+- [ ] Gigantti live search still needs a real browser or retailer feed; ingest routes around it via product pages but only with `HINTA_GIGANTTI_UA` set (an impersonation choice the tool leaves to the operator).
+- [ ] Ingest fetches product pages serially with a delay; it has no resume-across-interruptions beyond the `ingest_state` lastmod skip (which only helps sources that publish `<lastmod>` — Power, Gigantti). Proshop/Multitronic/Verkkokauppa re-walk fully each run.
+- [ ] Local search narrows with `LIKE`, which is diacritic-insensitive only for ASCII; a Finnish-diacritic query token can miss in the SQL narrowing (the Rust re-rank folds correctly, but only over what SQL returned).
 - [ ] Alerts are evaluated on `refresh`; there is no daemon. A cron entry plus `notify-send`/webhook on `alerts_triggered` would close that.
-- [ ] Search relevance is each retailer's own. Datatronic answers unrelated queries with fallback products (`televisio` returns CPU coolers), which `--devices-only` does not catch because they are genuine devices.
 - [ ] Power's price-history endpoint (`/api/v2/products/{id}/pricehistory`) could backfill history on first track.

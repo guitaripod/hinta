@@ -85,7 +85,15 @@ impl Store {
             conn.execute_batch("ALTER TABLE products ADD COLUMN sku TEXT;")?;
         }
         conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_products_ean ON products(ean) WHERE ean IS NOT NULL;",
+            "CREATE INDEX IF NOT EXISTS idx_products_ean ON products(ean) WHERE ean IS NOT NULL;
+
+             CREATE TABLE IF NOT EXISTS ingest_state (
+                source TEXT NOT NULL,
+                url TEXT NOT NULL,
+                lastmod TEXT,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (source, url)
+             );",
         )?;
         Ok(())
     }
@@ -262,6 +270,104 @@ impl Store {
         Ok(products)
     }
 
+    /// Searches the locally ingested catalogue, ranking by how much of the query
+    /// each product name contains.
+    ///
+    /// Offline — it never touches the network — and it applies the tool's own
+    /// relevance rather than the retailer's, which is the point of ingesting a
+    /// catalogue: a retailer that answers `televisio` with CPU coolers cannot
+    /// pollute a search over names we ranked ourselves.
+    pub fn search_local(
+        &self,
+        query: &str,
+        source: Option<&Source>,
+        limit: usize,
+    ) -> Result<Vec<Product>> {
+        let tokens: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let like_clause = tokens
+            .iter()
+            .map(|_| "p.name LIKE ? ESCAPE '\\'")
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!(
+            "SELECT {cols} FROM products p
+             WHERE ( ({like}) OR p.ean = ? OR p.sku = ? OR p.id = ? )
+             {src}
+             ORDER BY p.last_seen DESC
+             LIMIT ?",
+            cols = PRODUCT_COLUMNS,
+            like = like_clause,
+            src = if source.is_some() { "AND p.source = ?" } else { "" },
+        );
+
+        let mut binds: Vec<rusqlite::types::Value> = Vec::new();
+        for token in &tokens {
+            binds.push(format!("%{}%", like_escape(token)).into());
+        }
+        for _ in 0..3 {
+            binds.push(query.to_string().into());
+        }
+        if let Some(src) = source {
+            binds.push(source_str(src).to_string().into());
+        }
+        // Over-fetch candidates so the in-Rust relevance re-rank has room to work
+        // before the caller's limit is applied.
+        binds.push(((limit * 20).clamp(200, 4000) as i64).into());
+
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(binds), product_from_row)?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            candidates.push(row?);
+        }
+
+        let query_tokens = crate::matching::name_tokens(query);
+        candidates.sort_by(|a, b| {
+            crate::matching::name_relevance(&query_tokens, &b.name)
+                .total_cmp(&crate::matching::name_relevance(&query_tokens, &a.name))
+                .then(a.name.len().cmp(&b.name.len()))
+        });
+        candidates.truncate(limit);
+        Ok(candidates)
+    }
+
+    /// The sitemap `lastmod` last recorded for a URL, or `None` when the URL has
+    /// not been ingested or carried no timestamp — either way a reason to fetch.
+    pub fn ingest_lastmod(&self, source: &Source, url: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT lastmod FROM ingest_state WHERE source = ?1 AND url = ?2")?;
+        let mut rows = stmt.query_map(params![source_str(source), url], |row| {
+            row.get::<_, Option<String>>(0)
+        })?;
+        Ok(rows.next().transpose()?.flatten())
+    }
+
+    /// Records that a sitemap URL was ingested at a given `lastmod`, so an
+    /// unchanged one can be skipped on the next run.
+    pub fn record_ingest(&self, source: &Source, url: &str, lastmod: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO ingest_state (source, url, lastmod, fetched_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(source, url) DO UPDATE SET
+                lastmod = excluded.lastmod,
+                fetched_at = excluded.fetched_at",
+            params![
+                source_str(source),
+                url,
+                lastmod,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn get_product(&self, product_id: &str, source: &Source) -> Result<Option<Product>> {
         let conn = self.conn.lock().unwrap();
         let sql = format!(
@@ -403,6 +509,17 @@ pub struct StoreStats {
     pub price_points: usize,
     pub tracked: usize,
     pub by_source: Vec<SourceCount>,
+}
+
+/// Escapes the SQL `LIKE` wildcards so a query token is matched literally.
+fn like_escape(token: &str) -> String {
+    token
+        .chars()
+        .flat_map(|c| match c {
+            '\\' | '%' | '_' => vec!['\\', c],
+            other => vec![other],
+        })
+        .collect()
 }
 
 pub fn source_str(source: &Source) -> &'static str {
@@ -686,6 +803,79 @@ mod tests {
         assert_eq!(alerts[0].current_price, None);
         assert!(!alerts[0].triggered);
         assert_eq!(alerts[0].name, None);
+    }
+
+    #[test]
+    fn ingest_state_tracks_lastmod_for_incremental_skips() {
+        let store = Store::open_in_memory().unwrap();
+        let url = "https://www.power.fi/x/p-1/";
+
+        assert_eq!(store.ingest_lastmod(&Source::Power, url).unwrap(), None);
+
+        store
+            .record_ingest(&Source::Power, url, Some("2026-07-18"))
+            .unwrap();
+        assert_eq!(
+            store.ingest_lastmod(&Source::Power, url).unwrap().as_deref(),
+            Some("2026-07-18")
+        );
+
+        store
+            .record_ingest(&Source::Power, url, Some("2026-07-19"))
+            .unwrap();
+        assert_eq!(
+            store.ingest_lastmod(&Source::Power, url).unwrap().as_deref(),
+            Some("2026-07-19")
+        );
+
+        // A URL recorded without a timestamp reads back as a reason to re-fetch.
+        store.record_ingest(&Source::Power, url, None).unwrap();
+        assert_eq!(store.ingest_lastmod(&Source::Power, url).unwrap(), None);
+    }
+
+    #[test]
+    fn local_search_ranks_by_query_containment_and_is_offline() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .record_sighting(&sample(Source::Gigantti, "1", "Samsung 65\" U80 4K LED TV", 799.0))
+            .unwrap();
+        store
+            .record_sighting(&sample(Source::Power, "2", "Samsung 55\" U80 4K LED TV", 599.0))
+            .unwrap();
+        store
+            .record_sighting(&sample(Source::Jimms, "3", "Samsung TV seinäteline", 29.0))
+            .unwrap();
+        store
+            .record_sighting(&sample(Source::Datatronic, "4", "AMD Ryzen 7 7800X3D", 399.0))
+            .unwrap();
+
+        // AND of tokens: only the two U80 televisions carry both "samsung" and "u80".
+        let u80 = store.search_local("samsung u80", None, 10).unwrap();
+        assert_eq!(u80.len(), 2);
+        assert!(u80.iter().all(|p| p.name.contains("U80")));
+        assert!(!u80.iter().any(|p| p.name.contains("Ryzen")));
+
+        // A single common token nets every Samsung listing, wall mount included,
+        // but never the unrelated CPU.
+        let all_samsung = store.search_local("samsung", None, 10).unwrap();
+        assert_eq!(all_samsung.len(), 3);
+
+        let scoped = store
+            .search_local("samsung", Some(&Source::Power), 10)
+            .unwrap();
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].source, Source::Power);
+    }
+
+    #[test]
+    fn local_search_matches_an_ean_or_sku_exactly() {
+        let store = Store::open_in_memory().unwrap();
+        let mut p = sample(Source::Multitronic, "3930054", "AMD Ryzen 7 7800X3D", 359.90);
+        p.ean = Some("0730143314930".into());
+        store.record_sighting(&p).unwrap();
+
+        assert_eq!(store.search_local("0730143314930", None, 10).unwrap().len(), 1);
+        assert!(store.search_local("nonexistent gibberish", None, 10).unwrap().is_empty());
     }
 
     #[test]

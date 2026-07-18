@@ -149,37 +149,54 @@ pub(crate) fn parse_search_response(body: &str, limit: usize) -> Result<Vec<Prod
         .collect())
 }
 
-/// Reads a microdata property, preferring an explicit `content` attribute over
-/// the rendered text.
-fn microdata(doc: &Html, prop: &str) -> Option<String> {
+/// Reads a microdata property, trying each attribute in turn before the rendered
+/// text.
+///
+/// Jimms carries the value in a different attribute depending on the element:
+/// prices in `content`, availability in a `<link href>`, images in `<img src>`.
+fn microdata_attr(doc: &Html, prop: &str, attrs: &[&str]) -> Option<String> {
     let selector = Selector::parse(&format!("[itemprop=\"{}\"]", prop)).ok()?;
     let element = doc.select(&selector).next()?;
-    let value = element
-        .value()
-        .attr("content")
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| element.text().collect::<String>());
-    let trimmed = crate::util::squeeze_whitespace(&value);
-    (!trimmed.is_empty()).then_some(trimmed)
+    for attr in attrs {
+        if let Some(raw) = element.value().attr(attr) {
+            let trimmed = crate::util::squeeze_whitespace(raw);
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    let text = crate::util::squeeze_whitespace(&element.text().collect::<String>());
+    (!text.is_empty()).then_some(text)
+}
+
+fn microdata(doc: &Html, prop: &str) -> Option<String> {
+    microdata_attr(doc, prop, &["content"])
+}
+
+/// The product title from the page heading.
+///
+/// Preferred over an unscoped `[itemprop="name"]` lookup, whose first match is
+/// the breadcrumb root `<span itemprop="name">Jimms.fi</span>` — so the naive
+/// lookup named every product "Jimms.fi".
+fn product_title(doc: &Html) -> Option<String> {
+    let selector = Selector::parse("h1").ok()?;
+    doc.select(&selector)
+        .next()
+        .map(|el| crate::util::squeeze_whitespace(&el.text().collect::<String>()))
+        .filter(|n| !n.is_empty())
 }
 
 pub(crate) fn parse_product_page(html: &str, product_id: &str) -> Option<Product> {
     let doc = Html::parse_document(html);
 
-    let name = microdata(&doc, "name").or_else(|| {
-        let selector = Selector::parse("h1").ok()?;
-        doc.select(&selector)
-            .next()
-            .map(|el| crate::util::squeeze_whitespace(&el.text().collect::<String>()))
-            .filter(|n| !n.is_empty())
-    })?;
+    let name = product_title(&doc).or_else(|| microdata(&doc, "name"))?;
 
     let price = microdata(&doc, "price")
         .as_deref()
         .and_then(crate::util::parse_price)
         .unwrap_or(0.0);
 
-    let in_stock = microdata(&doc, "availability").map(|a| {
+    let in_stock = microdata_attr(&doc, "availability", &["content", "href"]).map(|a| {
         let a = a.to_lowercase();
         a.contains("instock") || a.contains("limitedavailability")
     });
@@ -190,7 +207,8 @@ pub(crate) fn parse_product_page(html: &str, product_id: &str) -> Option<Product
         price_euro: price,
         source: Source::Jimms,
         url: format!("{}/fi/Product/Show/{}", ORIGIN, product_id),
-        image_url: microdata(&doc, "image").map(|src| crate::util::absolute_url(ORIGIN, &src)),
+        image_url: microdata_attr(&doc, "image", &["content", "src"])
+            .map(|src| crate::util::absolute_url(ORIGIN, &src)),
         in_stock,
         ean: microdata(&doc, "gtin13").or_else(|| microdata(&doc, "gtin")),
         sku: microdata(&doc, "mpn"),
@@ -379,6 +397,35 @@ mod tests {
         assert_eq!(product.price_euro, 364.90);
         assert_eq!(product.in_stock, Some(true));
         assert_eq!(product.image_url.as_deref(), Some("https://ic.jimms.fi/a.jpg"));
+    }
+
+    #[test]
+    fn reads_the_real_page_shape_link_href_stock_img_src_and_h1_name() {
+        // The live page carries the breadcrumb root as the first itemprop=name,
+        // stock in a <link href>, and the image in <img src> — none of which the
+        // old content-only reader handled, so it named products "Jimms.fi" with
+        // unknown stock and no image.
+        let html = r#"<html><body>
+          <nav><span itemprop="name" class="visually-hidden">Jimms.fi</span></nav>
+          <h1><span itemprop="name">AMD Ryzen 7 7800X3D</span></h1>
+          <span itemprop="gtin13">0730143314930</span>
+          <span itemprop="mpn">100-100000910WOF</span>
+          <span itemprop="brand">AMD</span>
+          <meta itemprop="price" content="364.90">
+          <link itemprop="availability" href="http://schema.org/InStock">
+          <img itemprop="image" src="//ic.jimms.fi/product/x.jpg">
+        </body></html>"#;
+
+        let product = parse_product_page(html, "184639").unwrap();
+        assert_eq!(product.name, "AMD Ryzen 7 7800X3D");
+        assert_eq!(product.in_stock, Some(true));
+        assert_eq!(
+            product.image_url.as_deref(),
+            Some("https://ic.jimms.fi/product/x.jpg")
+        );
+        assert_eq!(product.ean.as_deref(), Some("0730143314930"));
+        assert_eq!(product.sku.as_deref(), Some("100-100000910WOF"));
+        assert_eq!(product.price_euro, 364.90);
     }
 
     #[test]

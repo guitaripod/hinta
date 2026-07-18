@@ -1,6 +1,7 @@
 pub mod http;
 pub mod matching;
 pub mod mcp;
+pub mod sitemap;
 pub mod sources;
 pub mod store;
 pub mod transform;
