@@ -410,28 +410,6 @@ fn is_spec_token(token: &str) -> bool {
     canonical_spec(token).is_some()
 }
 
-/// The stopword-filtered, canonically-specced tokens of a product name.
-///
-/// Shared between match scoring and local-search ranking so an ingested
-/// catalogue is ranked by the same notion of a name that `compare` uses.
-pub fn name_tokens(name: &str) -> BTreeSet<String> {
-    tokenize(name)
-        .iter()
-        .filter(|t| t.len() > 1 && !STOPWORDS.contains(&t.as_str()))
-        .map(|t| canonical_spec(t).unwrap_or_else(|| t.clone()))
-        .collect()
-}
-
-/// Overlap of `query` tokens present in a `name`, over the query size — how much
-/// of what the searcher asked for the listing actually mentions.
-pub fn name_relevance(query_tokens: &BTreeSet<String>, name: &str) -> f64 {
-    if query_tokens.is_empty() {
-        return 0.0;
-    }
-    let tokens = name_tokens(name);
-    query_tokens.intersection(&tokens).count() as f64 / query_tokens.len() as f64
-}
-
 /// A token identifies a model when it mixes letters and digits (`7800x3d`) or is
 /// a standalone number long enough to be a model designation (`4090`).
 fn is_model_token(token: &str) -> bool {
@@ -464,7 +442,11 @@ pub fn signature(product: &Product) -> Signature {
     // Measurements enter the name set in canonical form too, so a listing
     // saying `1000 GB` and one saying `1 Tt` agree on that word as well as on
     // the capacity check.
-    let name_tokens = name_tokens(&product.name);
+    let name_tokens: BTreeSet<String> = tokens
+        .iter()
+        .filter(|t| t.len() > 1 && !STOPWORDS.contains(&t.as_str()))
+        .map(|t| canonical_spec(t).unwrap_or_else(|| t.clone()))
+        .collect();
 
     let brand = product
         .brand
@@ -959,16 +941,6 @@ mod tests {
         ));
         assert_eq!(a.ean, None, "a placeholder EAN must not survive normalization");
         assert_eq!(compare_signatures(&a, &b), Verdict::Incompatible);
-    }
-
-    #[test]
-    fn name_tokens_are_exposed_for_local_ranking() {
-        let tokens = name_tokens("Samsung 990 PRO 1 TB NVMe SSD");
-        assert!(tokens.contains("samsung"));
-        assert!(tokens.contains("cap:1000gb"));
-        let query = name_tokens("samsung 990 pro");
-        assert_eq!(name_relevance(&query, "Samsung 990 PRO 1 TB"), 1.0);
-        assert!(name_relevance(&query, "Logitech MX Master") < 0.5);
     }
 
     #[test]

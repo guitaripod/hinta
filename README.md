@@ -29,7 +29,7 @@ posture, so an agent can route around what it may not fetch.
 
 ```bash
 cargo build --release
-cargo test                # 196 tests, no network required
+cargo test                # 181 tests, no network required
 ```
 
 ## Examples
@@ -39,8 +39,6 @@ hinta compare "samsung 990 pro" --enrich --json      # group across retailers
 hinta search "televisio" --devices-only --min-inches 65 --in-stock
 hinta compare "7800x3d" --multi-only                 # only products ≥2 retailers stock
 hinta alert 12345 --source power --below 750         # notify on refresh when price drops
-hinta ingest power --limit 500                        # pull a catalogue from the sitemap
-hinta search "samsung u80" --local                    # search the ingested catalogue offline
 hinta sources --json
 ```
 
@@ -50,28 +48,13 @@ before grouping, so the reported cheapest price always refers to a listing that
 passed. `--enrich` spends one product-page fetch per listing to fill in EANs the
 retailer omits from search, turning a fuzzy name match into a certain one.
 
-## Offline catalogue
-
-`hinta ingest <retailer>` walks a retailer's sitemap and stores every product —
-name, price, EAN, brand — in the local database, so `--local` searches and
-compares it without touching the network and ranks by hinta's own relevance
-rather than the retailer's. It reuses each retailer's product parser, so ingest
-is a crawler, not a second scraper. Sitemaps carrying `<lastmod>` (Power,
-Gigantti) re-ingest incrementally, skipping products that have not changed.
-
-Ingestable: Power, Verkkokauppa, Multitronic, Proshop, and — with
-`HINTA_GIGANTTI_UA` set — Gigantti, whose product pages are robots-permitted even
-though its search is walled off, making the sitemap the only route in. Datatronic
-(a 2021 sitemap, long stale) and Jimms (no sitemap) are excluded.
-
 ## MCP
 
 ```json
 {"mcpServers": {"hinta": {"command": "/path/to/hinta-mcp"}}}
 ```
 
-Fourteen tools mirror the CLI, including `ingest`, the `local` flag, and the
-filter and enrich arguments.
+Thirteen tools mirror the CLI, including the filter and enrich arguments.
 
 ## Matching
 

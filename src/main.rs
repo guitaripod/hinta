@@ -3,7 +3,6 @@ use serde::Serialize;
 use serde_json::json;
 
 use hinta::matching::{self, Filters, ProductGroup, DEFAULT_THRESHOLD};
-use hinta::sitemap::{self, IngestOptions};
 use hinta::sources::{
     all_sources, enrich_missing_eans, info_for, searchable_sources, source_for, RetailerSourceEnum,
 };
@@ -34,9 +33,6 @@ enum Commands {
         limit: usize,
         #[arg(long)]
         source: Option<String>,
-        /// Search the locally ingested catalogue instead of the retailers' sites
-        #[arg(long, default_value_t = false)]
-        local: bool,
         #[command(flatten)]
         filters: FilterArgs,
     },
@@ -62,26 +58,8 @@ enum Commands {
         /// Fetch product pages to learn EANs the search results omit
         #[arg(long, default_value_t = false)]
         enrich: bool,
-        /// Compare within the locally ingested catalogue instead of live search
-        #[arg(long, default_value_t = false)]
-        local: bool,
         #[command(flatten)]
         filters: FilterArgs,
-    },
-
-    /// Bulk-ingest a retailer's catalogue from its sitemap into the local database
-    Ingest {
-        /// Retailer id, or `all` for every sitemap-capable retailer
-        source: String,
-        /// Cap on product pages fetched this run (omit to ingest everything)
-        #[arg(long)]
-        limit: Option<usize>,
-        /// Seconds to wait between product fetches, to respect per-IP throttling
-        #[arg(long, default_value_t = 1.0)]
-        delay: f64,
-        /// Re-fetch every product even when its sitemap lastmod is unchanged
-        #[arg(long, default_value_t = false)]
-        full: bool,
     },
 
     /// Watch a product and report when it drops to a target price
@@ -264,25 +242,16 @@ async fn run_command(cli: Cli, store: &Store) -> anyhow::Result<()> {
             query,
             limit,
             source,
-            local,
             filters,
         } => {
-            let (products, errors, searched) = if local {
-                let src = source.as_deref().map(parse_source).transpose()?;
-                let products = store.search_local(&query, src.as_ref(), limit)?;
-                (products, Vec::new(), vec!["local".to_string()])
-            } else {
-                let sources = match source {
-                    Some(name) => vec![source_for(&parse_source(&name)?)],
-                    None => searchable_sources(),
-                };
-                let (products, errors) = fan_out(&sources, &query, limit).await;
-                for product in &products {
-                    let _ = store.record_sighting(product);
-                }
-                let searched = sources.iter().map(|s| s.source().name().to_string()).collect();
-                (products, errors, searched)
+            let sources = match source {
+                Some(name) => vec![source_for(&parse_source(&name)?)],
+                None => searchable_sources(),
             };
+            let (products, errors) = fan_out(&sources, &query, limit).await;
+            for product in &products {
+                let _ = store.record_sighting(product);
+            }
 
             let (products, filtered_out) = matching::apply_filters(products, &filters.into());
 
@@ -294,7 +263,7 @@ async fn run_command(cli: Cli, store: &Store) -> anyhow::Result<()> {
                         "results": products,
                         "total_hits": products.len(),
                         "filtered_out": filtered_out,
-                        "sources_searched": searched,
+                        "sources_searched": sources.iter().map(|s| s.source().name()).collect::<Vec<_>>(),
                         "errors": errors,
                     }))?
                 );
@@ -339,27 +308,18 @@ async fn run_command(cli: Cli, store: &Store) -> anyhow::Result<()> {
             threshold,
             multi_only,
             enrich,
-            local,
             filters,
         } => {
-            let (products, errors, searched) = if local {
-                // A local comparison ranks the whole ingested match set, so it
-                // pulls a generous candidate pool rather than a per-retailer limit.
-                let products = store.search_local(&query, None, limit.max(200))?;
-                (products, Vec::new(), vec!["local".to_string()])
-            } else {
-                let sources = searchable_sources();
-                let (products, errors) = fan_out(&sources, &query, limit).await;
-                for product in &products {
-                    let _ = store.record_sighting(product);
-                }
-                let searched = sources.iter().map(|s| s.source().name().to_string()).collect();
-                (products, errors, searched)
-            };
+            let sources = searchable_sources();
+            let (mut products, errors) = fan_out(&sources, &query, limit).await;
+            for product in &products {
+                let _ = store.record_sighting(product);
+            }
 
-            let (mut products, filtered_out) = matching::apply_filters(products, &filters.into());
+            let (mut products, filtered_out) =
+                matching::apply_filters(std::mem::take(&mut products), &filters.into());
 
-            let enriched = if enrich && !local {
+            let enriched = if enrich {
                 let count = enrich_missing_eans(&mut products).await;
                 for product in &products {
                     let _ = store.record_sighting(product);
@@ -383,64 +343,12 @@ async fn run_command(cli: Cli, store: &Store) -> anyhow::Result<()> {
                         "group_count": groups.len(),
                         "filtered_out": filtered_out,
                         "enriched": enriched,
-                        "sources_searched": searched,
+                        "sources_searched": sources.iter().map(|s| s.source().name()).collect::<Vec<_>>(),
                         "errors": errors,
                     }))?
                 );
             } else {
                 print_comparison(&query, &groups, filtered_out, &errors);
-            }
-        }
-
-        Commands::Ingest {
-            source,
-            limit,
-            delay,
-            full,
-        } => {
-            let opts = IngestOptions {
-                limit,
-                delay: hinta::util::duration_from_secs(delay)
-                    .ok_or_else(|| anyhow::anyhow!("--delay must be a finite number of seconds"))?,
-                full,
-            };
-            let sources: Vec<Source> = if source.eq_ignore_ascii_case("all") {
-                sitemap::ingestable_sources()
-            } else {
-                vec![parse_source(&source)?]
-            };
-
-            let mut reports = Vec::new();
-            let mut errors = Vec::new();
-            for src in &sources {
-                match sitemap::ingest(store, src, &opts).await {
-                    Ok(report) => {
-                        if !cli.json {
-                            print_ingest(&report);
-                        }
-                        reports.push(report);
-                    }
-                    Err(e) => {
-                        let err = SourceError {
-                            source: src.name().to_string(),
-                            error: first_line(&e.to_string()),
-                        };
-                        if !cli.json {
-                            eprintln!("{}: {}", err.source, e);
-                        }
-                        errors.push(err);
-                    }
-                }
-            }
-
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "ingested": reports,
-                        "errors": errors,
-                    }))?
-                );
             }
         }
 
@@ -877,19 +785,6 @@ fn print_comparison(
         }
     }
     print_errors(errors);
-}
-
-fn print_ingest(report: &sitemap::IngestReport) {
-    println!(
-        "{}: {} product URLs, {} fetched ({} with EAN), {} recorded, {} unchanged, {} errors",
-        report.source,
-        report.product_urls,
-        report.fetched,
-        report.with_ean,
-        report.recorded,
-        report.skipped_unchanged,
-        report.errors,
-    );
 }
 
 fn print_errors(errors: &[SourceError]) {

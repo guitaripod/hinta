@@ -3,7 +3,6 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 
 use crate::matching::{self, Filters, DEFAULT_THRESHOLD};
-use crate::sitemap::{self, IngestOptions};
 use crate::sources::{
     all_sources, enrich_missing_eans, info_for, searchable_sources, source_for,
 };
@@ -90,7 +89,6 @@ fn tool_definitions() -> Value {
                     "query": {"type": "string", "description": "Search term"},
                     "limit": {"type": "integer", "description": "Max results per retailer (default 10)"},
                     "source": {"type": "string", "description": format!("Restrict to one retailer: {}", source_names)},
-                    "local": {"type": "boolean", "description": "Search the locally ingested catalogue instead of the retailers' live sites (offline; requires a prior ingest)"},
                     "min_price": {"type": "number"},
                     "max_price": {"type": "number"},
                     "in_stock": {"type": "boolean", "description": "Exclude listings not confirmed in stock"},
@@ -113,7 +111,6 @@ fn tool_definitions() -> Value {
                     "threshold": {"type": "number", "description": "Match confidence needed to group two listings, 0.0-1.0 (default 0.55)"},
                     "multi_only": {"type": "boolean", "description": "Only return products carried by more than one retailer"},
                     "enrich": {"type": "boolean", "description": "Fetch product pages to learn EANs that search results omit, turning fuzzy name matches into certain ones. Costs one request per listing."},
-                    "local": {"type": "boolean", "description": "Group products from the locally ingested catalogue instead of live search (offline; requires a prior ingest)"},
                     "min_price": {"type": "number"},
                     "max_price": {"type": "number"},
                     "in_stock": {"type": "boolean", "description": "Exclude listings not confirmed in stock"},
@@ -123,20 +120,6 @@ fn tool_definitions() -> Value {
                     "devices_only": {"type": "boolean", "description": "Drop mounts, cables and installation services — a search like 'televisio' otherwise returns wall brackets"}
                 },
                 "required": ["query"]
-            }
-        },
-        {
-            "name": "ingest",
-            "description": "Bulk-ingest a retailer's catalogue from its sitemap into the local database, so it can be searched offline with `local: true`. Ingestable retailers: power, verkkokauppa, multitronic, proshop, gigantti (or 'all'). Costs one request per product page, so use `limit` for a bounded run.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "source": {"type": "string", "description": "Retailer id, or 'all' for every sitemap-capable retailer"},
-                    "limit": {"type": "integer", "description": "Cap on product pages fetched this run (omit to ingest the whole catalogue)"},
-                    "delay": {"type": "number", "description": "Seconds between product fetches (default 1.0), to respect per-IP throttling"},
-                    "full": {"type": "boolean", "description": "Re-fetch every product even when its sitemap lastmod is unchanged"}
-                },
-                "required": ["source"]
             }
         },
         {
@@ -386,27 +369,14 @@ pub(crate) async fn call_tool(
         "search" => {
             let query = required_str(arguments, "query")?;
             let limit = arguments["limit"].as_u64().unwrap_or(10) as usize;
-            let local = arguments["local"].as_bool().unwrap_or(false);
-
-            let (products, errors) = if local {
-                let source = match arguments["source"].as_str() {
-                    Some(raw) => Some(
-                        source_from_str(raw)
-                            .ok_or_else(|| anyhow::anyhow!("unknown source: {}", raw))?,
-                    ),
-                    None => None,
-                };
-                (store.search_local(&query, source.as_ref(), limit)?, Vec::new())
-            } else {
-                let sources = match arguments["source"].as_str() {
-                    Some(raw) => vec![source_for(
-                        &source_from_str(raw)
-                            .ok_or_else(|| anyhow::anyhow!("unknown source: {}", raw))?,
-                    )],
-                    None => searchable_sources(),
-                };
-                fan_out(store, &sources, &query, limit).await
+            let sources = match arguments["source"].as_str() {
+                Some(raw) => vec![source_for(
+                    &source_from_str(raw).ok_or_else(|| anyhow::anyhow!("unknown source: {}", raw))?,
+                )],
+                None => searchable_sources(),
             };
+
+            let (products, errors) = fan_out(store, &sources, &query, limit).await;
             let (products, filtered_out) =
                 matching::apply_filters(products, &filters_from(arguments));
             Ok(json!({
@@ -423,18 +393,13 @@ pub(crate) async fn call_tool(
             let limit = arguments["limit"].as_u64().unwrap_or(10) as usize;
             let threshold = arguments["threshold"].as_f64().unwrap_or(DEFAULT_THRESHOLD);
             let multi_only = arguments["multi_only"].as_bool().unwrap_or(false);
-            let local = arguments["local"].as_bool().unwrap_or(false);
 
-            let (products, errors) = if local {
-                (store.search_local(&query, None, limit.max(200))?, Vec::new())
-            } else {
-                let sources = searchable_sources();
-                fan_out(store, &sources, &query, limit).await
-            };
+            let sources = searchable_sources();
+            let (products, errors) = fan_out(store, &sources, &query, limit).await;
             let (mut products, filtered_out) =
                 matching::apply_filters(products, &filters_from(arguments));
 
-            let enriched = if arguments["enrich"].as_bool().unwrap_or(false) && !local {
+            let enriched = if arguments["enrich"].as_bool().unwrap_or(false) {
                 let count = enrich_missing_eans(&mut products).await;
                 for product in &products {
                     let _ = store.record_sighting(product);
@@ -456,34 +421,6 @@ pub(crate) async fn call_tool(
                 "enriched": enriched,
                 "errors": errors,
             }))
-        }
-
-        "ingest" => {
-            let raw = required_str(arguments, "source")?;
-            let opts = IngestOptions {
-                limit: arguments["limit"].as_u64().map(|v| v as usize),
-                delay: crate::util::duration_from_secs(arguments["delay"].as_f64().unwrap_or(1.0))
-                    .ok_or_else(|| anyhow::anyhow!("delay must be a finite number of seconds"))?,
-                full: arguments["full"].as_bool().unwrap_or(false),
-            };
-            let sources = if raw.eq_ignore_ascii_case("all") {
-                sitemap::ingestable_sources()
-            } else {
-                vec![source_from_str(&raw).ok_or_else(|| anyhow::anyhow!("unknown source: {}", raw))?]
-            };
-
-            let mut reports = Vec::new();
-            let mut errors = Vec::new();
-            for source in &sources {
-                match sitemap::ingest(store, source, &opts).await {
-                    Ok(report) => reports.push(serde_json::to_value(report)?),
-                    Err(e) => errors.push(json!({
-                        "source": source.name(),
-                        "error": e.to_string().lines().next().unwrap_or_default(),
-                    })),
-                }
-            }
-            Ok(json!({ "ingested": reports, "errors": errors }))
         }
 
         "set_alert" => {
@@ -719,7 +656,7 @@ mod tests {
         let value: Value = serde_json::from_str(&response).unwrap();
         let tools = value["result"]["tools"].as_array().unwrap();
 
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 13);
         for tool in tools {
             assert!(tool["name"].is_string());
             assert!(!tool["description"].as_str().unwrap().is_empty());
@@ -728,7 +665,7 @@ mod tests {
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         for expected in [
-            "search", "compare", "ingest", "get_product", "track", "untrack", "list_tracked",
+            "search", "compare", "get_product", "track", "untrack", "list_tracked",
             "price_history", "refresh", "sources", "stats", "set_alert", "clear_alert",
             "list_alerts",
         ] {
@@ -797,41 +734,6 @@ mod tests {
         let triggered = result["alerts_triggered"].as_array().unwrap();
         assert_eq!(triggered.len(), 1);
         assert_eq!(triggered[0]["current_price"], 780.0);
-    }
-
-    #[tokio::test]
-    async fn local_search_tool_reads_the_ingested_catalogue_offline() {
-        let store = store();
-        store
-            .record_sighting(&sample(Source::Gigantti, "1", "Samsung 65\" U80 4K LED TV", 799.0))
-            .unwrap();
-        store
-            .record_sighting(&sample(Source::Datatronic, "2", "AMD Ryzen 7 7800X3D", 399.0))
-            .unwrap();
-
-        let result = call_tool(
-            &store,
-            "search",
-            &json!({"query": "samsung u80", "local": true}),
-        )
-        .await
-        .unwrap();
-        assert_eq!(result["total_hits"], 1);
-        assert_eq!(result["results"][0]["name"], "Samsung 65\" U80 4K LED TV");
-    }
-
-    #[tokio::test]
-    async fn ingest_tool_reports_sources_without_a_sitemap_as_errors() {
-        let result = call_tool(&store(), "ingest", &json!({"source": "jimms"}))
-            .await
-            .unwrap();
-        assert!(result["ingested"].as_array().unwrap().is_empty());
-        let errors = result["errors"].as_array().unwrap();
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("no sitemap"));
     }
 
     #[tokio::test]
