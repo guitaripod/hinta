@@ -1,0 +1,37 @@
+[package]
+name = "hinta"
+version = "0.1.0"
+edition = "2021"
+description = "Agent-native CLI for Finnish electronics retailers — search, compare, track prices"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/guitaripod/hinta"
+readme = "README.md"
+
+[[bin]]
+name = "hinta"
+path = "src/main.rs"
+
+[[bin]]
+name = "hinta-mcp"
+path = "src/mcp_bin.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+# rustls, not the default native-tls: Cloudflare fingerprints the TLS ClientHello,
+# and native-tls's ALPN offer is challenged by some retailers while rustls passes.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json", "gzip", "brotli", "deflate", "cookies", "rustls-tls", "charset", "http2",
+] }
+scraper = "0.22"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.8"
