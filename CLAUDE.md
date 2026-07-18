@@ -1,12 +1,12 @@
 # Hinta — Agent-Native CLI for Finnish Electronics Retailers
 
-Rust, 8060 lines, 181 tests. Two binaries: `hinta` (CLI) and `hinta-mcp` (MCP server). SQLite at `~/.local/share/hinta/hinta.db`.
+Rust, 8155 lines, 183 tests. Two binaries: `hinta` (CLI) and `hinta-mcp` (MCP server). SQLite at `~/.local/share/hinta/hinta.db`.
 
 ## Quick start
 
 ```bash
 cargo build --release
-cargo test                                          # 181 tests, no network needed
+cargo test                                          # 183 tests, no network needed
 ./target/release/hinta compare "7800x3d" --enrich --json          # group across retailers
 ./target/release/hinta search "televisio" --devices-only --min-inches 65 --in-stock
 ./target/release/hinta sources --json               # capabilities + robots status per retailer
@@ -58,10 +58,12 @@ Four hard vetoes, any of which blocks a merge outright:
    - **Capacity** — `1 Tt` (Finnish *teratavu*), `1TB` and `1000 GB` all become `cap:1000gb`.
    - **Screen size** — `55"`, `55 tuuman` and `55 inch` all become `55inch`. The inch mark has to be rewritten *before* tokenizing, or it is stripped as punctuation and leaves a bare `55` that discriminates nothing.
 
-   **Neither is optional.** Without capacity normalization a 1 TB and a 4 TB drive merge; without screen size a 55" and a 65" television merge. Both bugs shipped and were caught only by running real queries.
+   **Neither is optional.** Without capacity normalization a 1 TB and a 4 TB drive merge; without screen size a 55" and a 65" television merge. Both bugs shipped and were caught only by running real queries. Both families are enforced by comparing the **maximum** canonical value directly (`capacity_gb`/`screen_inches`), *not* by testing the whole `spec_tokens` set for disjointness — a retailer that prints read/write speeds (`14 700 / 13 400 MB/s`) emits a `cap:0gb` token that is shared across every capacity of the same line, so disjointness never fires and a 1/2/4/8 TB family merges into one group reporting the 8 TB size at the 1 TB price. Taking the max discards that sub-gigabyte noise. This one also shipped, and only a live `9100 pro` query surfaced it — the fixtures carried clean capacities and no speed figures.
 4. **Disjoint model tokens.** `Ryzen 7 7800X3D` and `Ryzen 9 7950X` share every word except the one that matters.
 
 Scoring uses **containment (overlap coefficient), not Jaccard**. Retailers describe the same product at wildly different verbosity, and Jaccard punishes that asymmetry because extra words inflate the union. Model similarity is additionally scaled by the **length of the longest shared model token**, so a shared `7800x3d` counts far more than a shared `am5` — that scaling is what stops a CPU merging with a motherboard that mentions the same socket.
+
+Bus-width and form-factor codes (`x4`, `x16`, `2280`) are kept **out** of the model tokens, because they say how a part connects and its physical size, not which product it is. Left in, they dilute the containment: a retailer writing `9100 PRO M.2 2280 PCIe x4` and one writing `9100 PRO` would share `9100` out of two tokens apiece, halving model similarity and dropping the pair below threshold — which split every Proshop/Jimms M.2 SSD into its own single-retailer group until a live `9100 pro` query exposed it. They are matched against closed, standardized lists (PCIe lane widths, M.2 lengths), so a genuine chipset model like `X570` or `X99` is never mistaken for a lane count.
 
 Clustering is agglomerative (a listing joins only if compatible with *every* member, so contradictory EANs cannot chain transitively), followed by a **merge pass** that joins any two mutually compatible clusters. Without that pass, results depend on the order retailers happen to reply in, and one product splits across two groups.
 
@@ -172,7 +174,7 @@ Data dir: `HINTA_DATA_DIR`, default `~/.local/share/hinta`.
 
 ## Testing
 
-`cargo test` runs 176 tests with **no network access** — parsers are tested against captured payload fixtures, so the suite stays deterministic when a retailer changes its catalogue. Verify the offline guarantee with `unshare -r -n cargo test --lib`; a test that reaches the network is a bug, not a slow test. When adding a scraper, capture one real response and write the parser test from it rather than asserting against live data.
+`cargo test` runs 183 tests with **no network access** — parsers are tested against captured payload fixtures, so the suite stays deterministic when a retailer changes its catalogue. Verify the offline guarantee with `unshare -r -n cargo test --lib`; a test that reaches the network is a bug, not a slow test. When adding a scraper, capture one real response and write the parser test from it rather than asserting against live data.
 
 ## Known gaps / next steps
 

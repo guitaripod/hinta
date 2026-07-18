@@ -413,7 +413,7 @@ fn is_spec_token(token: &str) -> bool {
 /// A token identifies a model when it mixes letters and digits (`7800x3d`) or is
 /// a standalone number long enough to be a model designation (`4090`).
 fn is_model_token(token: &str) -> bool {
-    if is_spec_token(token) {
+    if is_spec_token(token) || is_bus_or_form_factor(token) {
         return false;
     }
     let has_digit = token.chars().any(|c| c.is_ascii_digit());
@@ -426,6 +426,22 @@ fn is_model_token(token: &str) -> bool {
     } else {
         token.len() >= 3
     }
+}
+
+/// Bus-width and physical-form-factor codes describe how a part connects and its
+/// size, not which product it is: `M.2 2280 PCIe x4` says nothing that
+/// distinguishes one NVMe drive from another.
+///
+/// Left among the model tokens they dilute the real identifier. A retailer that
+/// writes `9100 PRO M.2 2280 PCIe x4` and one that writes `9100 PRO` then share
+/// only `9100` out of two tokens apiece — model containment collapses to a half
+/// and drops the pair below the merge threshold, splitting one drive across
+/// retailers. These are closed, standardized enumerations, matched exactly, so a
+/// genuine chipset model like `X570` or `X99` is never mistaken for a lane count.
+fn is_bus_or_form_factor(token: &str) -> bool {
+    const PCIE_LANE_WIDTHS: &[&str] = &["x1", "x2", "x4", "x8", "x16", "x32"];
+    const M2_FORM_FACTORS: &[&str] = &["2230", "2242", "2260", "2280", "22110"];
+    PCIE_LANE_WIDTHS.contains(&token) || M2_FORM_FACTORS.contains(&token)
 }
 
 pub fn signature(product: &Product) -> Signature {
@@ -507,6 +523,28 @@ pub enum Verdict {
     Score(f64, MatchBasis),
 }
 
+/// Whether two listings state a different capacity or screen size.
+///
+/// The generic `spec_tokens` disjointness check below is too weak to enforce
+/// this on its own: a retailer that prints read/write speeds (`14 700 / 13 400
+/// MB/s`) emits a `cap:0gb` spec token, and that noise is *shared* across every
+/// capacity of the same product line — so the sets are never disjoint and the
+/// real discriminator (`cap:1000gb` vs `cap:8000gb`) is defeated. `capacity_gb`
+/// and `screen_inches` take the maximum, which discards the sub-gigabyte noise,
+/// so comparing them directly is what actually keeps a 1 TB drive from merging
+/// with an 8 TB one, or a 55" television with a 65".
+fn measurements_conflict(a: &Signature, b: &Signature) -> bool {
+    let capacity_differs = matches!(
+        (a.capacity_gb(), b.capacity_gb()),
+        (Some(x), Some(y)) if x != y
+    );
+    let screen_differs = matches!(
+        (a.screen_inches(), b.screen_inches()),
+        (Some(x), Some(y)) if x != y
+    );
+    capacity_differs || screen_differs
+}
+
 /// Judges whether two listings describe the same product.
 ///
 /// Evidence is applied strongest-first: a validated EAN is decisive in both
@@ -529,6 +567,10 @@ pub fn compare_signatures(a: &Signature, b: &Signature) -> Verdict {
     }
 
     if a.qualifiers != b.qualifiers {
+        return Verdict::Incompatible;
+    }
+
+    if measurements_conflict(a, b) {
         return Verdict::Incompatible;
     }
 
@@ -1078,6 +1120,59 @@ mod tests {
         match compare_signatures(&one_tb, &thousand_gb) {
             Verdict::Score(_, _) => {}
             Verdict::Incompatible => panic!("1TB and 1000 GB are the same capacity"),
+        }
+    }
+
+    #[test]
+    fn stated_speeds_do_not_defeat_the_capacity_veto() {
+        let two_tb = signature(&product(
+            Source::Jimms,
+            "1",
+            "Samsung 2TB 9100 PRO SSD-levy, PCIe 5.0 x4, NVMe 2.0, 14 700 / 13 400 MB/s",
+            0.0,
+        ));
+        let eight_tb = signature(&product(
+            Source::Jimms,
+            "2",
+            "Samsung 8TB 9100 PRO SSD-levy, PCIe 5.0 x4, NVMe 2.0, 14 800 / 13 400 MB/s",
+            0.0,
+        ));
+        assert!(
+            !two_tb.spec_tokens.is_disjoint(&eight_tb.spec_tokens),
+            "the shared cap:0gb speed noise is what makes disjointness insufficient",
+        );
+        assert_eq!(
+            compare_signatures(&two_tb, &eight_tb),
+            Verdict::Incompatible,
+            "a 2 TB and an 8 TB drive must never merge, speed figures notwithstanding",
+        );
+    }
+
+    #[test]
+    fn bus_and_form_factor_noise_does_not_split_one_drive_across_retailers() {
+        let proshop = signature(&product(
+            Source::Proshop,
+            "1",
+            "Samsung 9100 PRO SSD - 1TB - Ilman jäähdytyssiiliä - M.2 2280 - PCIe 5.0",
+            259.13,
+        ));
+        let jimms = signature(&product(
+            Source::Jimms,
+            "2",
+            "Samsung 1TB 9100 PRO SSD-levy, PCIe 5.0 x4, NVMe 2.0, 14 700 / 13 300 MB/s",
+            258.90,
+        ));
+        assert!(
+            !proshop.model_tokens.contains("2280") && !jimms.model_tokens.contains("x4"),
+            "the form factor and lane count must not be treated as model identifiers",
+        );
+        match compare_signatures(&proshop, &jimms) {
+            Verdict::Score(score, MatchBasis::Model) => assert!(
+                score >= DEFAULT_THRESHOLD,
+                "the same 1 TB 9100 PRO must merge across retailers, scored {}",
+                score,
+            ),
+            other => panic!("expected a model-based merge, got {:?}", other),
         }
     }
 

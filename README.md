@@ -29,7 +29,7 @@ posture, so an agent can route around what it may not fetch.
 
 ```bash
 cargo build --release
-cargo test                # 181 tests, no network required
+cargo test                # 183 tests, no network required
 ```
 
 ## Examples
